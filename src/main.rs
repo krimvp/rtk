@@ -49,6 +49,8 @@ pub enum AgentTarget {
     Pi,
     /// Hermes CLI
     Hermes,
+    /// Factory Droid CLI
+    Droid,
 }
 
 #[derive(Parser)]
@@ -775,6 +777,8 @@ enum HookCommands {
     Gemini,
     /// Process Copilot preToolUse hook (VS Code + Copilot CLI, reads JSON from stdin)
     Copilot,
+    /// Process Factory Droid PreToolUse hook (reads JSON from stdin)
+    Droid,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -1392,6 +1396,8 @@ where
 {
     if agent == Some(AgentTarget::Hermes) {
         uninstall_hermes(ctx)
+    } else if agent == Some(AgentTarget::Droid) {
+        hooks::init::uninstall_droid(global, ctx)
     } else {
         let cursor = agent == Some(AgentTarget::Cursor);
         let pi = agent == Some(AgentTarget::Pi);
@@ -1879,6 +1885,8 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_antigravity_mode(ctx)?;
             } else if agent == Some(AgentTarget::Hermes) {
                 hooks::init::run_hermes_mode(ctx)?;
+            } else if agent == Some(AgentTarget::Droid) {
+                hooks::init::run_droid_mode(global, ctx)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -2210,6 +2218,10 @@ fn run_cli() -> Result<i32> {
             }
             HookCommands::Copilot => {
                 hooks::hook_cmd::run_copilot()?;
+                0
+            }
+            HookCommands::Droid => {
+                hooks::hook_cmd::run_droid()?;
                 0
             }
             HookCommands::Check { agent: _, command } => {
