@@ -555,6 +555,113 @@ fn run_cursor_inner_with_rules(
     }
 }
 
+// ── Factory Droid PreToolUse hook ──────────────────────────────
+//
+// Droid's PreToolUse payload (docs.factory.ai/reference/hooks-reference) is
+// shaped like Claude Code's: `tool_name`, `tool_input.command`, and a
+// `hookSpecificOutput` response with `permissionDecision` + `updatedInput`.
+// Droid's shell-execution tool is matched as `Execute`; non-Execute payloads
+// pass through silently.
+
+fn process_droid_payload(v: &Value) -> Option<Value> {
+    let tool_name = v.get("tool_name").and_then(|t| t.as_str()).unwrap_or("");
+    // `Execute` is Droid's shell tool. The installed matcher already gates
+    // invocations to Execute; also tolerate a missing tool_name and accept
+    // `Bash` defensively for Claude-shaped payloads (Droid itself has no Bash
+    // tool — verified against Droid v0.164.0).
+    if !matches!(tool_name, "Execute" | "Bash" | "") {
+        return None;
+    }
+
+    let cmd = v
+        .pointer("/tool_input/command")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())?;
+
+    droid_response_from_decision(v, cmd, decide_hook_action(cmd, permissions::Host::Claude))
+}
+
+/// Build the Droid hook response for a decision from the shared flow.
+///
+/// On `Deny` we step aside (emit no output) so Droid's native deny handling
+/// fires, matching Claude/Cursor/Copilot. `Defer` (command substitution, file
+/// redirects, or no rewrite available) also stays silent so Droid runs the
+/// command unchanged. RTK never emits its own block here.
+fn droid_response_from_decision(v: &Value, cmd: &str, decision: HookDecision) -> Option<Value> {
+    let (rewritten, allow) = match decision {
+        HookDecision::Deny => {
+            audit_log("deny", cmd, "");
+            return None;
+        }
+        HookDecision::Defer => return None,
+        HookDecision::AllowRewrite(r) => (r, true),
+        HookDecision::AskRewrite(r) => (r, false),
+    };
+
+    audit_log("rewrite", cmd, &rewritten);
+
+    let updated_input = {
+        let mut ti = v.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+        if let Some(obj) = ti.as_object_mut() {
+            obj.insert("command".into(), Value::String(rewritten));
+        }
+        ti
+    };
+
+    // Wire format mirrors Claude's `hookSpecificOutput`; the allow policy mirrors
+    // `process_claude_payload`, NOT Cursor. Verified against Droid 0.140.0 and
+    // re-verified in the shipped v0.164.0 code: Droid applies a hook's
+    // `updatedInput` regardless of the permission decision — beyond the
+    // `case "allow"` branch it has an "updated input result" path that applies any
+    // hook's `updatedInput` even when no decision is set. So forcing "allow" is
+    // unnecessary for the rewrite to land, and would be harmful: Droid resolves
+    // the decision as `find(first result with a permissionDecision)` (no
+    // deny-over-allow priority), so an unconditional "allow" can suppress another
+    // PreToolUse hook's deny/ask and bypasses Droid's native permission prompt.
+    // We therefore only assert "allow" on an explicit allow rule; otherwise we
+    // omit the decision so the rewrite still applies while the user's other hooks
+    // and Droid's native prompt stay in control.
+    let mut hook_output = json!({
+        "hookEventName": PRE_TOOL_USE_KEY,
+        "permissionDecisionReason": "RTK auto-rewrite",
+        "updatedInput": updated_input
+    });
+
+    if allow {
+        hook_output["permissionDecision"] = json!("allow");
+    }
+
+    Some(json!({ "hookSpecificOutput": hook_output }))
+}
+
+/// Run the Factory Droid PreToolUse hook natively.
+pub fn run_droid() -> Result<()> {
+    let input = read_stdin_limited()?;
+    let input = strip_leading_bom(&input).trim();
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    let v: Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+            return Ok(());
+        }
+    };
+
+    if let Some(output) = process_droid_payload(&v) {
+        let _ = writeln!(io::stdout(), "{output}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_droid_inner(input: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(input).ok()?;
+    process_droid_payload(&v).map(|o| o.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,5 +1518,141 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(v["decision"], "deny");
+    }
+
+    // --- Factory Droid hook ---
+
+    fn droid_input(tool: &str, cmd: &str) -> String {
+        json!({
+            "session_id": "abc123",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": { "command": cmd }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_droid_rewrites_execute_tool() {
+        let input = droid_input("Execute", "git status");
+        let out = run_droid_inner(&input).expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let updated = v
+            .pointer("/hookSpecificOutput/updatedInput/command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        assert!(
+            updated.starts_with("rtk "),
+            "expected rtk-prefixed rewrite, got `{updated}`"
+        );
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/hookEventName")
+                .and_then(|c| c.as_str()),
+            Some("PreToolUse")
+        );
+        // Default verdict (no rule) must OMIT permissionDecision. Verified
+        // against Droid 0.140.0: `updatedInput` is applied regardless of the
+        // decision, so omitting it lets the rewrite land while preserving
+        // Droid's native prompt and other hooks' deny/ask (Droid picks the
+        // first hook result that sets a decision). Mirrors the Claude handler.
+        assert!(
+            v.pointer("/hookSpecificOutput/permissionDecision")
+                .is_none(),
+            "default verdict must not force a permission decision"
+        );
+    }
+
+    #[test]
+    fn test_droid_ignores_non_execute_tool() {
+        // Droid fires PreToolUse for many tools (Edit, Create, Read…); we must
+        // only touch Execute (or legacy Bash) so other tools pass through.
+        let input = droid_input("Edit", "git status");
+        assert!(
+            run_droid_inner(&input).is_none(),
+            "non-Execute tools must not produce output"
+        );
+    }
+
+    #[test]
+    fn test_droid_bash_tool_name_accepted_defensively() {
+        // Droid has no Bash tool, but Claude-shaped payloads are accepted
+        // defensively; the installed matcher gates invocations to Execute.
+        let input = droid_input("Bash", "git status");
+        assert!(
+            run_droid_inner(&input).is_some(),
+            "Bash tool name should still rewrite"
+        );
+    }
+
+    #[test]
+    fn test_droid_deny_steps_aside() {
+        // A denied command must produce NO output so Droid's native deny
+        // handling fires — matching Claude/Cursor/Copilot. RTK must not emit
+        // its own `permissionDecision: deny` block. Decision is injected
+        // because decide_hook_action loads ambient rules that aren't present
+        // in the test environment.
+        let v: Value = serde_json::from_str(&droid_input("Execute", "git push --force")).unwrap();
+        assert!(
+            droid_response_from_decision(&v, "git push --force", HookDecision::Deny).is_none(),
+            "deny must step aside (no output), not emit an RTK block"
+        );
+    }
+
+    #[test]
+    fn test_droid_allow_decision_auto_allows() {
+        // An explicit allow rule auto-allows the rewritten command.
+        let v: Value = serde_json::from_str(&droid_input("Execute", "git status")).unwrap();
+        let out = droid_response_from_decision(
+            &v,
+            "git status",
+            HookDecision::AllowRewrite("rtk git status".to_string()),
+        )
+        .expect("rewrite expected");
+        assert_eq!(
+            out.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(|c| c.as_str()),
+            Some("allow")
+        );
+        assert_eq!(
+            out.pointer("/hookSpecificOutput/updatedInput/command")
+                .and_then(|c| c.as_str()),
+            Some("rtk git status")
+        );
+    }
+
+    #[test]
+    fn test_droid_substitution_defers() {
+        // Commands with substitution can't be attested — the shared decision
+        // flow defers so Droid runs the original command unchanged.
+        for cmd in ["git status `rm -rf /tmp/x`", "git status $(rm -rf /tmp/x)"] {
+            let input = droid_input("Execute", cmd);
+            assert!(
+                run_droid_inner(&input).is_none(),
+                "substitution must defer (no output) for {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_droid_file_redirect_defers() {
+        let input = droid_input("Execute", "git log > /tmp/out.txt");
+        assert!(
+            run_droid_inner(&input).is_none(),
+            "file redirects must defer (no output)"
+        );
+    }
+
+    #[test]
+    fn test_droid_empty_command_passthrough() {
+        let input = droid_input("Execute", "");
+        assert!(run_droid_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_droid_no_rewrite_passthrough() {
+        // Commands rtk doesn't know about should not generate a hookSpecificOutput
+        // so Droid runs them unchanged.
+        let input = droid_input("Execute", "definitely-not-a-real-binary --foo");
+        assert!(run_droid_inner(&input).is_none());
     }
 }
